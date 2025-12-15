@@ -146,6 +146,12 @@
 							<report>test-javadoc</report>
 						</reports>
 					</reportSet>
+					<reportSet>
+						<id>javadoc</id>
+						<reports>
+							<report>javadoc</report>
+						</reports>
+					</reportSet>
 				</reportSets>
 				<configuration>
 					<stylesheetfile>${basedir}/target/site/apidocs/stylesheet.css</stylesheetfile>
