@@ -1,0 +1,418 @@
+name: Post-Merge Release Pipeline
+
+# Se ejecuta cuando hay un push en main (p.e. tras merge)
+on:
+  push:
+    branches: 
+      - main-pipeline-merge
+
+permissions:
+  contents: write        # para push tags
+  issues: write          # para cerrar issues / comentar
+  pull-requests: write   # para comentar PR
+  pages: write           # para deploy GitHub Pages
+  id-token: write
+
+concurrency:
+  group: post-merge-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      MAVEN_OPTS: -Xmx2g
+
+    steps:
+      - name: Checkout repository (history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run Maven tests (capture log)
+        id: mvn-tests
+        run: |
+          set -o pipefail
+          mvn -B clean test | tee test-log.txt
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "test_exit=${TEST_EXIT}" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload test-log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ github.sha }}
+          path: test-log.txt
+
+      - name: SonarCloud Scan (Maven)
+        id: sonarscan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          # Ajusta sonar.host.url/organization/project según tu setup
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            -Dsonar.login="${{ secrets.SONAR_TOKEN }}" \
+            -Dsonar.branch.name="post-merge-${{ github.sha }}" \
+            || echo "sonar_failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: SonarCloud Quality Gate
+        id: qualitygate
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        with:
+          scanMetadataReportFile: target/sonar/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        continue-on-error: true
+
+      - name: Collect basic results
+        id: collect
+        run: |
+          echo "mvn_test_exit=${{ steps.mvn-tests.outputs.test_exit }}" >> $GITHUB_OUTPUT || true
+          echo "sonar_qg=${{ steps.qualitygate.outputs.quality-gate-status }}" >> $GITHUB_OUTPUT || true
+      - name: Determine release channel and status
+        id: determine-channel
+        run: |
+          # Reglas aplicadas:
+          # - Si los tests han fallado (exit != 0) => canal = alfa
+          # - Else si Sonar Quality Gate != PASSED => canal = beta
+          # - Else => canal = release
+          TEST_EXIT="${{ steps.mvn-tests.outputs.test_exit }}"
+          SONAR_QG="${{ steps.qualitygate.outputs.quality-gate-status }}"
+          if [ -z "$TEST_EXIT" ]; then TEST_EXIT=0; fi
+          if [ "$TEST_EXIT" -ne 0 ]; then
+            CHANNEL="alfa"
+          elif [ "$SONAR_QG" != "PASSED" ]; then
+            CHANNEL="beta"
+          else
+            CHANNEL="release"
+          fi
+          echo "channel=${CHANNEL}" >> $GITHUB_OUTPUT
+          echo "Detected channel=${CHANNEL} (test_exit=${TEST_EXIT}, sonar_qg=${SONAR_QG})"
+      # ---------------------------
+      # Extraer issues referenciadas en los commits del push
+      - name: Extract referenced issues from commits
+        id: extract-issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const before = process.env.GITHUB_SHA_BEFORE || '${{ github.event.before }}';
+            const after = process.env.GITHUB_SHA || '${{ github.sha }}';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // Obtener lista de commits entre before..after
+            const commits = await github.rest.repos.compareCommits({
+              owner, repo, base: before, head: after
+            }).then(r => r.data.commits).catch(e => {
+              // Fallback si compare falla (p.e. fast-forward), usar single commit
+              return [];
+            });
+            let msgs = [];
+            if (commits.length === 0) {
+              // fallback: usa HEAD commit message
+              const head = await github.rest.repos.getCommit({ owner, repo, ref: after });
+              msgs.push(head.data.commit.message);
+            } else {
+              for (const c of commits) msgs.push(c.commit.message);
+            }
+            const text = msgs.join("\n");
+            // Regex para capturar referencias de issues: Fixes #123, Closes #45, #67
+            const issueRegex = /(?:fixe?s|close[sd]?|resolve[sd]?|\b)#?(\d+)/ig;
+            const refs = new Set();
+            let m;
+            while ((m = issueRegex.exec(text)) !== null) {
+              refs.add(parseInt(m[1], 10));
+            }
+            // También captura "#123" sueltos
+            const hashRegex = /#(\d+)\b/g;
+            while ((m = hashRegex.exec(text)) !== null) refs.add(parseInt(m[1],10));
+            const issues = Array.from(refs).filter(n => !isNaN(n));
+            core.setOutput("issues", JSON.stringify(issues));
+            return issues;
+        env:
+          GITHUB_SHA_BEFORE: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Get issue details and detect reopens
+        id: issues-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = JSON.parse(process.env.ISSUES || '[]');
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const result = [];
+            for (const n of issues) {
+              try {
+                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: n });
+                // Revisar eventos para detectar 'reopened'
+                const events = await github.rest.issues.listEventsForTimeline({
+                  owner, repo, issue_number: n,
+                  per_page: 100
+                }).then(r => r.data).catch(_=>[]);
+                const reopened = events.some(ev => ev.event === 'reopened');
+                result.push({ number: n, state: issue.state, title: issue.title, reopened });
+              } catch (e) {
+                // ignore missing
+                result.push({ number: n, state: 'unknown', title: '', reopened: false, error: true });
+              }
+            }
+            core.setOutput("issues_info", JSON.stringify(result));
+            return result;
+        env:
+          ISSUES: ${{ steps.extract-issues.outputs.issues }}
+
+      - name: Decide semantic version bump
+        id: calc-version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const semverRegex = /(?:alfa|beta|release)-(\d+)\.(\d+)\.(\d+)$/i;
+            const owner = context.repo.owner, repo = context.repo.repo;
+            // 1) Buscar tags ordenadas descendente
+            const tags = await github.rest.repos.listTags({ owner, repo, per_page: 100 }).then(r => r.data);
+            let lastVer = { major:0, minor:0, patch:0, raw:"0.0.0", tag:"release-0.0.0" };
+            for (const t of tags) {
+              const m = t.name.match(semverRegex);
+              if (m) {
+                const maj = parseInt(m[1],10), min = parseInt(m[2],10), pat = parseInt(m[3],10);
+                lastVer = { major:maj, minor:min, patch:pat, raw:`${maj}.${min}.${pat}`, tag: t.name };
+                break;
+              }
+            }
+            // 2) Analizar issues para decidir bump
+            const issuesInfo = JSON.parse(process.env.ISSUES_INFO || '[]');
+            const closedIssues = issuesInfo.filter(i => i.state === 'closed' || i.error !== true);
+            const reopenedAny = issuesInfo.some(i => i.reopened);
+            let bump = 'patch'; // default
+            // Regla propuesta:
+            // - Si alguna referenced issue tiene un evento 'reopened' => MAJOR
+            // - Else si se han cerrado >= 3 issues => MINOR
+            // - Else if closed issues between 1-2 => PATCH
+            // - Si no hay issues cerradas => PATCH
+            if (reopenedAny && issuesInfo.length > 0) {
+              bump = 'major';
+            } else if (closedIssues.length >= 3) {
+              bump = 'minor';
+            } else {
+              bump = 'patch';
+            }
+            // 3) Calcular nueva versión numérica a partir de lastVer
+            let newMajor = lastVer.major, newMinor = lastVer.minor, newPatch = lastVer.patch;
+            if (bump === 'major') {
+              newMajor = lastVer.major + 1;
+              newMinor = 0;
+              newPatch = 0;
+            } else if (bump === 'minor') {
+              newMinor = lastVer.minor + 1;
+              newPatch = 0;
+            } else {
+              // patch
+              newPatch = lastVer.patch + 1;
+            }
+            const newVersion = `${newMajor}.${newMinor}.${newPatch}`;
+            core.setOutput("bump", bump);
+            core.setOutput("previous_version", lastVer.raw);
+            core.setOutput("new_version", newVersion);
+            core.setOutput("new_major", newMajor.toString());
+            core.setOutput("new_minor", newMinor.toString());
+            core.setOutput("new_patch", newPatch.toString());
+            core.setOutput("issues_count", issuesInfo.length.toString());
+            core.setOutput("issues_info", JSON.stringify(issuesInfo));
+            return { newVersion, bump, issuesInfo };
+        env:
+          ISSUES_INFO: ${{ steps.issues-info.outputs.issues_info }}
+
+      - name: Create tag and push
+        id: create-tag
+        run: |
+          CHANNEL=${{ steps.determine-channel.outputs.channel }}
+          NEW_VER=${{ steps.calc-version.outputs.new_version }}
+          TAG_NAME="${CHANNEL}-${NEW_VER}"
+          echo "Tag will be: $TAG_NAME"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG_NAME" -m "Release $TAG_NAME (auto-generated) for merge ${GITHUB_SHA}"
+          git push origin "refs/tags/$TAG_NAME"
+          echo "tag=${TAG_NAME}" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build changelog
+        id: changelog
+        run: |
+          CHANNEL=${{ steps.determine-channel.outputs.channel }}
+          TAG=${{ steps.create-tag.outputs.tag }}
+          NEW_VER=${{ steps.calc-version.outputs.new_version }}
+          SONAR_QG="${{ steps.qualitygate.outputs.quality-gate-status }}"
+          TEST_EXIT=${{ steps.mvn-tests.outputs.test_exit }}
+          ISSUES_INFO='${{ steps.calc-version.outputs.issues_info }}'
+
+          echo "## Release: ${TAG}" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "- Canal: **${CHANNEL}**" >> CHANGELOG.md
+          echo "- Versión numérica: **${NEW_VER}**" >> CHANGELOG.md
+          echo "- Sonar Quality Gate: **${SONAR_QG}**" >> CHANGELOG.md
+          if [ -z "$TEST_EXIT" ]; then TEST_EXIT=0; fi
+          if [ "$TEST_EXIT" -ne 0 ]; then
+            echo "- Tests: **FALLÓ** (ver test-log.txt adjunto)" >> CHANGELOG.md
+          else
+            echo "- Tests: **OK**" >> CHANGELOG.md
+          fi
+          echo "" >> CHANGELOG.md
+          echo "### Commits incluidos" >> CHANGELOG.md
+          git --no-pager log --pretty=format:"- %h %s (%an)" ${GITHUB_SHA}~5..${GITHUB_SHA} | sed -n '1,200p' >> CHANGELOG.md || true
+
+          echo "" >> CHANGELOG.md
+          echo "### Issues referenciadas y cierre" >> CHANGELOG.md
+          python3 - <<'PY'
+          import json, os
+          info = json.loads(os.environ.get('ISSUES_INFO','[]'))
+          if not info:
+              print("- (Ninguna issue referenciada)")
+          else:
+              for i in info:
+                  num = i.get('number')
+                  title = i.get('title','')
+                  st = i.get('state','unknown')
+                  reopened = i.get('reopened', False)
+                  print(f"- #{num} — {title} — estado: {st} — reopened:{reopened}")
+          PY
+                    # attach pointer to test artifact and sonar (if available)
+                    echo "" >> CHANGELOG.md
+                    echo "### Logs / Artefactos" >> CHANGELOG.md
+                    echo "- Test log artifact: attached to workflow run (test-log-${GITHUB_SHA})" >> CHANGELOG.md
+                    echo "- Sonar report: https://sonarcloud.io (ver proyecto)" >> CHANGELOG.md
+          
+                    # output
+                    echo "changelog_path=CHANGELOG.md" >> $GITHUB_OUTPUT
+        env:
+          ISSUES_INFO: ${{ steps.calc-version.outputs.issues_info }}
+
+      - name: Create GitHub Release
+        id: create-release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ steps.create-tag.outputs.tag }}
+          release_name: Release ${{ steps.create-tag.outputs.tag }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ steps.determine-channel.outputs.channel != 'release' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach test log to release (upload the artifact to the release)
+        if: always()
+        uses: softprops/action-gh-release@v1
+        with:
+          files: test-log.txt
+          tag_name: ${{ steps.create-tag.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Close referenced issues & comment
+        id: close-issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = JSON.parse(process.env.ISSUES_INFO || '[]');
+            const tag = process.env.TAG;
+            for (const i of issues) {
+              try {
+                // Add a comment and close the issue (if not already closed)
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: i.number,
+                  body: `Cerrada automáticamente por la release ${tag} (merge ${process.env.GITHUB_SHA}).`
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: i.number,
+                  state: 'closed'
+                });
+              } catch (e) {
+                // ignore
+              }
+            }
+            return issues.length;
+        env:
+          ISSUES_INFO: ${{ steps.calc-version.outputs.issues_info }}
+          TAG: ${{ steps.create-tag.outputs.tag }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Comment on original PR(s) about release & tag
+        id: comment-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const sha = process.env.GITHUB_SHA;
+            // buscar PRs cuyo merge_commit_sha sea este SHA
+            const prs = await github.rest.pulls.list({
+              owner, repo, state: 'closed', per_page: 100
+            }).then(r => r.data.filter(p => p.merge_commit_sha === sha));
+            const tag = process.env.TAG;
+            const releaseUrl = `https://github.com/${owner}/${repo}/releases/tag/${tag}`;
+            for (const pr of prs) {
+              await github.rest.issues.createComment({
+                owner, repo,
+                issue_number: pr.number,
+                body: `✅ Este PR ha sido mergeado y se ha creado la release **${tag}**.\n\nVer release: ${releaseUrl}`
+              });
+            }
+            return prs.map(p=>p.number);
+        env:
+          TAG: ${{ steps.create-tag.outputs.tag }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Delete merged branch (if exists remotely)
+        id: delete-branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Intentamos detectar la rama que generó este merge
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const sha = process.env.GITHUB_SHA;
+            // buscar PR cerrado con merge_commit_sha = sha
+            const prs = await github.rest.pulls.list({
+              owner, repo, state: 'closed', per_page: 100
+            }).then(r => r.data.filter(p => p.merge_commit_sha === sha));
+            for (const p of prs) {
+              const headRef = p.head.ref;
+              const headRepo = p.head.repo ? p.head.repo.full_name : null;
+              if (headRepo && headRepo.toLowerCase().startsWith(`${owner}/`)) {
+                // eliminar ref remota
+                try {
+                  await github.rest.git.deleteRef({ owner, repo, ref: `heads/${headRef}` });
+                  console.log(`Deleted remote branch: ${headRef}`);
+                } catch(e) {
+                  console.log(`Could not delete branch ${headRef}: ${e.message}`);
+                }
+              } else {
+                console.log(`Branch ${headRef} belongs to external fork or no permission to delete.`);
+              }
+            }
+            return prs.length;
+      - name: Generate Javadoc
+        run: |
+          mvn -B site
+          
+      - name: Verify Javadoc Directory
+        run: |
+          ls -l target/site/apidocs
+          
+      - name: Deploy Javadoc to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/site/apidocs
