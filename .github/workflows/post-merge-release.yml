@@ -4,7 +4,7 @@ name: Post-Merge Release Pipeline
 on:
   push:
     branches: 
-      - main-pipeline-merge
+      - main
 
 permissions:
   contents: write        # para push tags
