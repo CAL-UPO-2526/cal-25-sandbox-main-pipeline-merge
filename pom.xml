@@ -139,21 +139,6 @@
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-javadoc-plugin</artifactId>
 				<version>3.12.0</version>
-				<executions>
-					<execution>
-						<id>attach-javadocs</id>
-						<goals>
-							<goal>jar</goal>
-						</goals>
-					</execution>
-					<execution>
-						<id>attach-test-javadocs</id>
-						<goals>
-							<goal>test-javadoc</goal>
-						</goals>
-						<phase>site</phase>
-					</execution>
-				</executions>
 				<configuration>
 					<stylesheetfile>${basedir}/target/site/apidocs/stylesheet.css</stylesheetfile>
 					<show>private</show>
