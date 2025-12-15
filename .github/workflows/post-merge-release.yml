@@ -409,7 +409,7 @@ jobs:
           
       - name: Verify Javadoc Directory
         run: |
-          ls -l target/site/apidocs
+          ls -l target/site
           
       - name: Deploy Javadoc to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
