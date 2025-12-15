@@ -407,12 +407,35 @@ jobs:
         run: |
           mvn -B site
           
-      - name: Verify Javadoc Directory
+      - name: Verify Test Javadoc Directory
         run: |
           ls -l target/site/testapidocs
+
+      - name: Verify Javadoc Directory
+        run: |
+          ls -l target/site/apidocs
+        continue-on-error: true
+
+      - name: Create Pages Index (Landing Page)
+        run: |
+          # Crea la carpeta raíz para el despliegue
+          mkdir -p deploy-root
+
+          # Copia los Javadocs a la nueva raíz con nombres distintivos
+          cp -r target/site/apidocs deploy-root/main-api
+          cp -r target/site/testapidocs deploy-root/test-api
+
+          # Crea el index.html principal (¡Importante!)
+          echo "<html><head><title>Documentación de ${GITHUB_REPOSITORY}</title></head><body>" > deploy-root/index.html
+          echo "<h1>Documentación del Proyecto Cal-25 Selenium</h1>" >> deploy-root/index.html
+          echo "<ul>" >> deploy-root/index.html
+          echo "<li><a href='./main-api/index.html'>Documentación de la API (Código de Producción)</a></li>" >> deploy-root/index.html
+          echo "<li><a href='./test-api/index.html'>Documentación de las Pruebas (Tests y P.O.)</a></li>" >> deploy-root/index.html
+          echo "</ul></body></html>" >> deploy-root/index.html
           
       - name: Deploy Javadoc to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./target/site/testapidocs
+          publish_dir: ./deploy-root
+          force_orphan: true
