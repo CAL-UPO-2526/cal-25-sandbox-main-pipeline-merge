@@ -246,6 +246,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+
+      - name: Prepare Documentation Url
+        id: prepare-url
+        run: |
+          # Generar el enlace de GitHub Pages de forma automática
+          # Pattern: https://<Owner>.github.io/<Repository>/
+          REPO_PARTS=(${GITHUB_REPOSITORY//\// })
+          OWNER=${REPO_PARTS[0],,} # Convierte a minúsculas
+          REPO=${REPO_PARTS[1]}
+          DOC_URL="https://${OWNER}.github.io/${REPO}/"
+          
+          # Exportar el enlace para el Changelog
+          echo "doc_url=${DOC_URL}" >> $GITHUB_OUTPUT
+
       - name: Build changelog
         id: changelog
         run: |
@@ -255,6 +269,7 @@ jobs:
           SONAR_QG="${{ steps.qualitygate.outputs.quality-gate-status }}"
           TEST_EXIT=${{ steps.mvn-tests.outputs.test_exit }}
           ISSUES_INFO='${{ steps.calc-version.outputs.issues_info }}'
+          DOC_URL="${{ steps.prepare-url.outputs.doc_url }}"
 
           echo "## Release: ${TAG}" > CHANGELOG.md
           echo "" >> CHANGELOG.md
@@ -289,6 +304,7 @@ jobs:
                     # attach pointer to test artifact and sonar (if available)
                     echo "" >> CHANGELOG.md
                     echo "### Logs / Artefactos" >> CHANGELOG.md
+                    echo "- **Documentación Javadoc**: [Ver Docs](${DOC_URL})" >> CHANGELOG.md #
                     echo "- Test log artifact: attached to workflow run (test-log-${GITHUB_SHA})" >> CHANGELOG.md
                     echo "- Sonar report: https://sonarcloud.io (ver proyecto)" >> CHANGELOG.md
           
@@ -416,22 +432,36 @@ jobs:
           ls -l target/site/apidocs
         continue-on-error: true
 
-      - name: Create Pages Index (Landing Page)
+      - name: Prepare Documentation Root
+        id: prepare-docs
         run: |
-          # Crea la carpeta raíz para el despliegue
-          mkdir -p deploy-root
+          # Directorio temporal de despliegue
+          DEPLOY_DIR="deploy-root"
+          mkdir -p $DEPLOY_DIR
 
-          # Copia los Javadocs a la nueva raíz con nombres distintivos
-          cp -r target/site/apidocs deploy-root/main-api
-          cp -r target/site/testapidocs deploy-root/test-api
+          # Copiar documentaciones a subdirectorios
+          cp -r target/site/apidocs $DEPLOY_DIR/main-api
+          cp -r target/site/testapidocs $DEPLOY_DIR/test-api
+          
+          # Generar el enlace de GitHub Pages de forma automática
+          # Pattern: https://<Owner>.github.io/<Repository>/
+          REPO_PARTS=(${GITHUB_REPOSITORY//\// })
+          OWNER=${REPO_PARTS[0],,} # Convierte a minúsculas
+          REPO=${REPO_PARTS[1]}
+          DOC_URL="https://${OWNER}.github.io/${REPO}/"
 
-          # Crea el index.html principal (¡Importante!)
-          echo "<html><head><title>Documentación de ${GITHUB_REPOSITORY}</title></head><body>" > deploy-root/index.html
-          echo "<h1>Documentación del Proyecto Cal-25 Selenium</h1>" >> deploy-root/index.html
-          echo "<ul>" >> deploy-root/index.html
-          echo "<li><a href='./main-api/index.html'>Documentación de la API (Código de Producción)</a></li>" >> deploy-root/index.html
-          echo "<li><a href='./test-api/index.html'>Documentación de las Pruebas (Tests y P.O.)</a></li>" >> deploy-root/index.html
-          echo "</ul></body></html>" >> deploy-root/index.html
+          # Crear el index.html principal (Landing Page)
+          echo "<html><head><title>Documentación de ${GITHUB_REPOSITORY}</title>" > $DEPLOY_DIR/index.html
+          echo "<meta http-equiv=\"refresh\" content=\"0; URL=./main-api/index.html\" />" >> $DEPLOY_DIR/index.html
+          echo "</head><body>" >> $DEPLOY_DIR/index.html
+          echo "<h1>Documentación del Proyecto ${REPO}</h1>" >> $DEPLOY_DIR/index.html
+          echo "<ul>" >> $DEPLOY_DIR/index.html
+          echo "<li><a href='./main-api/index.html'>Documentación de la API (Código de Producción)</a></li>" >> $DEPLOY_DIR/index.html
+          echo "<li><a href='./test-api/index.html'>Documentación de las Pruebas (Tests y P.O.)</a></li>" >> $DEPLOY_DIR/index.html
+          echo "</ul></body></html>" >> $DEPLOY_DIR/index.html
+          
+          # Exportar el enlace para el Changelog
+          echo "doc_url=${DOC_URL}" >> $GITHUB_OUTPUT
           
       - name: Deploy Javadoc to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
